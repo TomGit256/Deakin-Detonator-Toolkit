@@ -202,6 +202,11 @@
                         "cmd": "impacket-wmiexec",
                         "args": true
                     },
+                    {	
+                        "name": "ip",
+                    	"cmd": "ip",
+                    	"args": true 
+                    },
                     {
                         "name": "john",
                         "cmd": "john",
