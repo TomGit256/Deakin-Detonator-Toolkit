@@ -10,18 +10,18 @@ import { RenderComponent } from "../UserGuide/UserGuide";
 
 type ScanMode = "interface" | "range" | "list";
 
+const NETDISCOVER_TABLE_HEADER = " IP            At MAC Address     Count     Len  MAC Vendor / Hostname";
+const NETDISCOVER_TABLE_SEPARATOR =
+    "-----------------------------------------------------------------------------";
+
 interface FormValuesType {
     interface: string;
     ipRange: string;
     ipList: string;
 }
 
-const IP_RANGE_REGEX =
-    /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}\/(([0-9])|([1-2][0-9])|(3[0-2]))$/;
-
-const SINGLE_IP_REGEX =
-    /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/;
-
+const IP_RANGE_REGEX = /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}\/(([0-9])|([1-2][0-9])|(3[0-2]))$/;
+const SINGLE_IP_REGEX = /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/;
 const INTERFACE_NAME_FORMAT_REGEX = /^[a-zA-Z][a-zA-Z0-9:_.-]{0,14}$/;
 
 const parseInterfaceNames = (rawOutput: string): string[] => {
@@ -36,12 +36,39 @@ const parseInterfaceNames = (rawOutput: string): string[] => {
     return Array.from(new Set(names));
 };
 
-const parseIPList = (raw: string): string[] =>
+interface ListEntry {
+    ip: string;
+    iface?: string;
+}
+
+const parseIPListEntries = (raw: string): ListEntry[] =>
     raw
         .split(/[\n,]+/)
-        .map((ip) => ip.trim())
-        .filter((ip) => ip.length > 0);
+        .map((token) => token.trim())
+        .filter((token) => token.length > 0)
+        .map((token) => {
+            const [ip, iface] = token.split(":").map((part) => part.trim());
+            return { ip, iface: iface || undefined };
+        });
 
+const ipToInt = (ip: string): number => ip.split(".").reduce((acc, octet) => (acc << 8) + Number(octet), 0) >>> 0;
+
+const intToIp = (n: number): string => [24, 16, 8, 0].map((shift) => (n >>> shift) & 255).join(".");
+
+const getSingleHostRange = (ip: string): string => {
+    const n = ipToInt(ip);
+    let prefix = 30;
+    while (prefix >= 24) {
+        const mask = (~0 << (32 - prefix)) >>> 0;
+        const network = (n & mask) >>> 0;
+        const broadcast = (network + (2 ** (32 - prefix) - 1)) >>> 0;
+        if (n !== network && n !== broadcast) {
+            return `${intToIp(network)}/${prefix}`;
+        }
+        prefix--;
+    }
+    return `${intToIp(n & 0xffffff00)}/24`;
+};
 
 const ToggleLink = ({ label, onClick }: { label: string; onClick: () => void }) => (
     <Text size="xs" color="blue" style={{ cursor: "pointer", width: "fit-content" }} onClick={onClick}>
@@ -85,20 +112,21 @@ function NetDiscover() {
     const [availableInterfaces, setAvailableInterfaces] = useState<string[]>([]);
     const [loadingInterfaces, setLoadingInterfaces] = useState(true);
     const [manualInterfaceEntry, setManualInterfaceEntry] = useState(false);
+    const [listScanProgress, setListScanProgress] = useState<{ current: number; total: number } | null>(null);
 
     const processRef = useRef<any>(null);
+    const cancelledRef = useRef(false);
 
     const form = useForm<FormValuesType>({
         initialValues: { interface: "", ipRange: "", ipList: "" },
 
         validate: (values) => ({
             interface:
-                scanMode === "interface"
-                    ? (() => {
-                          if (!values.interface) {
-                              return "Please select or enter a network interface (e.g., eth0).";
-                          }
-
+                !values.interface
+                    ? scanMode === "interface"
+                        ? "Please select or enter a network interface (e.g., eth0)."
+                        : null
+                    : (() => {
                           if (availableInterfaces.length > 0) {
                               return availableInterfaces.includes(values.interface)
                                   ? null
@@ -106,12 +134,11 @@ function NetDiscover() {
                                         ", "
                                     )}). Please choose one from the list.`;
                           }
-                          
+
                           return INTERFACE_NAME_FORMAT_REGEX.test(values.interface)
                               ? null
                               : "That doesn't look like a valid interface name (e.g., eth0, wlan0).";
-                      })()
-                    : null,
+                      })(),
             ipRange:
                 scanMode === "range"
                     ? !values.ipRange
@@ -123,13 +150,23 @@ function NetDiscover() {
             ipList:
                 scanMode === "list"
                     ? (() => {
-                          const ips = parseIPList(values.ipList);
-                          if (ips.length === 0) {
-                              return "Please enter at least one IP address (one per line or comma-separated).";
+                          const entries = parseIPListEntries(values.ipList);
+                          if (entries.length === 0) {
+                              return "Please enter at least one IP address (one per line or comma-separated, optionally as ip:interface).";
                           }
-                          const invalid = ips.filter((ip) => !SINGLE_IP_REGEX.test(ip));
-                          if (invalid.length > 0) {
-                              return `These entries aren't valid IP addresses: ${invalid.join(", ")}`;
+                          const badIps = entries.filter((e) => !SINGLE_IP_REGEX.test(e.ip)).map((e) => e.ip);
+                          if (badIps.length > 0) {
+                              return `These entries aren't valid IP addresses: ${badIps.join(", ")}`;
+                          }
+                          if (availableInterfaces.length > 0) {
+                              const badIfaces = entries
+                                  .filter((e) => e.iface && !availableInterfaces.includes(e.iface))
+                                  .map((e) => `${e.ip}:${e.iface}`);
+                              if (badIfaces.length > 0) {
+                                  return `These entries specify an interface that wasn't detected (${availableInterfaces.join(
+                                      ", "
+                                  )}): ${badIfaces.join(", ")}`;
+                              }
                           }
                           return null;
                       })()
@@ -164,23 +201,20 @@ function NetDiscover() {
     }, [fetchInterfaces]);
 
     const handleProcessData = useCallback((data: string) => {
-        // Removes ANSI escape codes and unnecessary characters
-        
         const cleanedData = data.replace(
-            // Regex to remove ANSI escape sequences
             /\x1B\[[0-9;]*[a-zA-Z]/g,
             ""
         );
-        
-        // Prevent output of empty lines or random characters
-        if (cleanedData.trim() !== "") {
-            setOutput((prev) => prev + "\n" + cleanedData.trim());
-        }
+
+        if (cleanedData.trim() === "") return;
+
+        setOutput((prev) => prev + "\n" + cleanedData.trim());
     }, []);
 
     const handleProcessTermination = useCallback(({ code, signal }: { code: number; signal: number }) => {
         setOutput(
-            (prev) => prev + (signal === 2 ? "\nScanning stopped manually." : `\nNetDiscover exited (code ${code}).`)
+            (prev) =>
+                prev + (signal === 2 || signal === 9 ? "\nScanning stopped manually." : `\nNetDiscover exited (code ${code}).`)
         );
         setLoading(false);
         setAllowSave(true);
@@ -193,20 +227,98 @@ function NetDiscover() {
     };
 
     const buildArgs = (values: FormValuesType): string[] => {
+        const ifaceArgs = values.interface ? ["-i", values.interface] : [];
         if (scanMode === "range") {
-            return ["-r", values.ipRange];
-        }
-        if (scanMode === "list") {
-            const ips = parseIPList(values.ipList);
-            return ips.flatMap((ip) => ["-r", `${ip}/30`]);
+            return [...ifaceArgs, "-r", values.ipRange];
         }
         return ["-i", values.interface];
+    };
+
+    const killNetDiscover = async (): Promise<string> => {
+        try {
+            const result = await CommandHelper.runCommand("pkexec", ["pkill", "-9", "-x", "netdiscover"]);
+            return result.trim();
+        } catch (error: any) {
+            return `Error running pkill: ${error?.message ?? error}`;
+        }
+    };
+
+    const LIST_SCAN_TIMEOUT_MS = 15000;
+
+
+    const runSingleTargetScan = (ip: string, interfaceName: string | undefined): Promise<void> => {
+        const args = interfaceName
+            ? ["-i", interfaceName, "-r", getSingleHostRange(ip)]
+            : ["-r", getSingleHostRange(ip)];
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                resolve();
+            };
+
+            const timeoutId = setTimeout(async () => {
+                await killNetDiscover();
+                setOutput(
+                    (prev) => prev + `\n(Moving to next target.)`
+                );
+                processRef.current = null;
+                finish();
+            }, LIST_SCAN_TIMEOUT_MS);
+		
+            CommandHelper.runCommandWithPkexec(
+                "netdiscover",
+                args,
+                handleProcessData,
+                () => {
+                    processRef.current = null;
+                    finish();
+                }
+            )
+                .then((handle) => {
+                    processRef.current = handle;
+                })
+                .catch((error: any) => {
+                    setOutput((prev) => prev + `\nError scanning ${ip}: ${getFriendlyErrorMessage(error?.message, "list")}`);
+                    finish();
+                });
+        });
+    };
+
+    const runListScanSequence = async (entries: ListEntry[], globalInterface: string) => {
+        cancelledRef.current = false;
+        for (let i = 0; i < entries.length; i++) {
+            if (cancelledRef.current) break;
+            const { ip, iface } = entries[i];
+            const effectiveInterface = iface || globalInterface || undefined;
+            setListScanProgress({ current: i + 1, total: entries.length });
+            setOutput(
+                (prev) =>
+                    prev +
+                    `\n\n--- Scanning ${ip}${effectiveInterface ? ` via ${effectiveInterface}` : ""} (${i + 1}/${entries.length}) ---\n` +
+                    `${NETDISCOVER_TABLE_HEADER}\n${NETDISCOVER_TABLE_SEPARATOR}`
+            );
+            await runSingleTargetScan(ip, effectiveInterface);
+        }
+        setListScanProgress(null);
+        setOutput(
+            (prev) => prev + (cancelledRef.current ? "\n\nScanning stopped manually." : "\n\nFinished scanning all selected targets.")
+        );
+        setLoading(false);
+        setAllowSave(true);
     };
 
     const onSubmit = async (values: FormValuesType) => {
         setLoading(true);
         setAllowSave(false);
         setOutput("");
+
+        if (scanMode === "list") {
+            runListScanSequence(parseIPListEntries(values.ipList), values.interface);
+            return;
+        }
 
         const args = buildArgs(values);
 
@@ -223,21 +335,11 @@ function NetDiscover() {
     };
 
     const cancelScan = async () => {
-        if (processRef.current) {
-            await CommandHelper.runCommand("pkexec", ["kill", "-9", processRef.current.pid])
-                .then(() => setOutput((prev) => prev + `\nScanning manually stopped (PID: ${processRef.current.pid}).`))
-                .catch((error: any) =>
-                    setOutput((prev) => prev + `\nError stopping scan: ${getFriendlyErrorMessage(error?.message, scanMode)}`)
-                )
-                .finally(() => {
-                    setLoading(false);
-                    setAllowSave(true);
-                    processRef.current = null;
-                });
-        } else {
-            setOutput((prev) => prev + `\nNo active scanning process to stop.`);
-            setLoading(false);
-        }
+        if (scanMode === "list") cancelledRef.current = true;
+
+        await killNetDiscover();
+        setOutput((prev) => prev + `\nStop signal sent. Waiting for NetDiscover to exit...`);
+        processRef.current = null;
     };
 
     const clearOutput = () => {
@@ -272,6 +374,64 @@ function NetDiscover() {
                 <form onSubmit={form.onSubmit(onSubmit)}>
                     <Stack spacing="md">
                         <Stack spacing={4}>
+                            {loadingInterfaces ? (
+                                <Group spacing="xs">
+                                    <Loader size="xs" />
+                                    <Text size="sm" color="dimmed">
+                                        Detecting available interfaces...
+                                    </Text>
+                                </Group>
+                            ) : availableInterfaces.length > 0 && !manualInterfaceEntry ? (
+                                <>
+                                    <Select
+                                        label="Network Interface"
+                                        description={
+                                            scanMode === "interface"
+                                                ? "The local network adapter to scan on, e.g. eth0 or wlan0."
+                                                : scanMode === "list"
+                                                ? "Default adapter for targets that don't specify their own (see ip:interface syntax below). Recommended if your machine has more than one adapter."
+                                                : "Optional, but strongly recommended if your machine has more than one adapter (e.g. a NAT and a host-only network in a VM) - without it, the scan may run on the wrong network and find nothing."
+                                        }
+                                        placeholder="Select an interface"
+                                        data={availableInterfaces}
+                                        searchable
+                                        clearable={scanMode !== "interface"}
+                                        required={scanMode === "interface"}
+                                        {...form.getInputProps("interface")}
+                                    />
+                                    <ToggleLink
+                                        label="Can't find your interface? Enter it manually."
+                                        onClick={() => setManualInterfaceEntry(true)}
+                                    />
+                                </>
+                            ) : (
+                                <>
+                                    <TextInput
+                                        label="Network Interface"
+                                        description={
+                                            availableInterfaces.length > 0
+                                                ? `Must exactly match one of your detected interfaces: ${availableInterfaces.join(
+                                                      ", "
+                                                  )}.`
+                                                : "We couldn't detect your interfaces automatically, so this can only be checked for a valid format, not that it actually exists."
+                                        }
+                                        placeholder="e.g., eth0, wlan0"
+                                        required={scanMode === "interface"}
+                                        {...form.getInputProps("interface")}
+                                    />
+                                    {availableInterfaces.length > 0 ? (
+                                        <ToggleLink
+                                            label="Choose from detected interfaces instead."
+                                            onClick={() => setManualInterfaceEntry(false)}
+                                        />
+                                    ) : (
+                                        <ToggleLink label="Retry detection" onClick={fetchInterfaces} />
+                                    )}
+                                </>
+                            )}
+                        </Stack>
+
+                        <Stack spacing={4}>
                             <SegmentedControl
                                 value={scanMode}
                                 onChange={(value) => setScanMode(value as ScanMode)}
@@ -288,59 +448,6 @@ function NetDiscover() {
                             </Text>
                         </Stack>
 
-                        {scanMode === "interface" && (
-                            <Stack spacing={4}>
-                                {loadingInterfaces ? (
-                                    <Group spacing="xs">
-                                        <Loader size="xs" />
-                                        <Text size="sm" color="dimmed">
-                                            Detecting available interfaces...
-                                        </Text>
-                                    </Group>
-                                ) : availableInterfaces.length > 0 && !manualInterfaceEntry ? (
-                                    <>
-                                        <Select
-                                            label="Network Interface"
-                                            description="The local network adapter to scan on, e.g. eth0 or wlan0."
-                                            placeholder="Select an interface"
-                                            data={availableInterfaces}
-                                            searchable
-                                            required
-                                            {...form.getInputProps("interface")}
-                                        />
-                                        <ToggleLink
-                                            label="Can't find your interface? Enter it manually."
-                                            onClick={() => setManualInterfaceEntry(true)}
-                                        />
-                                    </>
-                                ) : (
-                                    <>
-                                        <TextInput
-                                            label="Network Interface"
-                                            description={
-                                                availableInterfaces.length > 0
-                                                    ? `Must exactly match one of your detected interfaces: ${availableInterfaces.join(
-                                                          ", "
-                                                      )}.`
-                                                    : "We couldn't detect your interfaces automatically, so this can only be checked for a valid format, not that it actually exists."
-                                            }
-                                            placeholder="e.g., eth0, wlan0"
-                                            required
-                                            {...form.getInputProps("interface")}
-                                        />
-                                        {availableInterfaces.length > 0 ? (
-                                            <ToggleLink
-                                                label="Choose from detected interfaces instead."
-                                                onClick={() => setManualInterfaceEntry(false)}
-                                            />
-                                        ) : (
-                                            <ToggleLink label="Retry detection" onClick={fetchInterfaces} />
-                                        )}
-                                    </>
-                                )}
-                            </Stack>
-                        )}
-
                         {scanMode === "range" && (
                             <TextInput
                                 label="IP Range (CIDR)"
@@ -354,8 +461,8 @@ function NetDiscover() {
                         {scanMode === "list" && (
                             <Textarea
                                 label="IP List"
-                                description="One or more specific IP addresses to scan, separated by commas or new lines, e.g. 192.168.1.10, 192.168.1.25. Only these hosts will be scanned."
-                                placeholder={"e.g.\n192.168.1.10\n192.168.1.25\n192.168.1.40"}
+                                description="One or more specific IP addresses, separated by commas or new lines. Each is scanned one at a time. Add :interface to pin a target to a specific adapter (e.g. 192.168.1.10:eth0) if your targets live on different networks - otherwise the default interface above is used. Each IP address is scanned for 15 seconds before it moves on"
+                                placeholder={"e.g.\n192.168.1.10\n192.168.1.25:eth1\n192.168.1.40"}
                                 minRows={3}
                                 required
                                 {...form.getInputProps("ipList")}
@@ -375,7 +482,9 @@ function NetDiscover() {
                             <Alert radius="md">
                                 {scanMode === "range" && `Scanning IP range: ${form.values.ipRange}`}
                                 {scanMode === "list" &&
-                                    `Scanning ${parseIPList(form.values.ipList).length} selected target(s).`}
+                                    (listScanProgress
+                                        ? `Scanning target ${listScanProgress.current} of ${listScanProgress.total}...`
+                                        : "Starting scan...")}
                                 {scanMode === "interface" && `Scanning on interface: ${form.values.interface}`}
                             </Alert>
                         )}
