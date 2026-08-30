@@ -59,6 +59,19 @@ export function BEDTool() {
     const pluginRequiringEmail = ["SMTP"];
     const pluginsRequiringUsername = ["SOCKS4"];
 
+    // Validation patterns for target address and port.
+    // IPv4: each octet must be 0-255 (rejects values like 999.999.999.999).
+    const IPV4_REGEX =
+        /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
+
+    // Hostname: labels of 1-63 alphanumerics/hyphens, not starting/ending with a hyphen.
+    const HOSTNAME_REGEX =
+        /^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$/;
+
+    // Matches the *shape* of a dotted-quad (e.g. 999.999.999.999) so such values are
+    // forced through strict IPv4 validation instead of leaking through as a "hostname"
+    const DOTTED_QUAD_SHAPE_REGEX = /^\d+\.\d+\.\d+\.\d+$/;
+
     // Form hook to handle form input.
     const form = useForm<FormValuesType>({
         initialValues: {
@@ -70,6 +83,9 @@ export function BEDTool() {
             password: "",
         },
         validate: {
+            plugin: (value) => {
+                return value ? null : "A plugin must be selected before a scan can begin";
+            },
             username: (value, values) => {
                 if (pluginsRequiringAuth.includes(values.plugin) || pluginsRequiringUsername.includes(values.plugin)) {
                     return /^[a-zA-Z0-9_]+$/.test(value) ? null : "Invalid username";
@@ -87,6 +103,26 @@ export function BEDTool() {
                     return /^\S+@\S+\.\S+$/.test(value) ? null : "Invalid email";
                 }
                 return null;
+            },
+            target: (value) => {
+                if (!customConfig) return null;
+                if (!value) return "Target IP address or hostname is required";
+                if (DOTTED_QUAD_SHAPE_REGEX.test(value)) {
+                    return IPV4_REGEX.test(value)
+                        ? null
+                        : "Enter a valid IP address (each octet must be between 0 and 255)";
+                }
+                if (value.toLowerCase() === "localhost") return null;
+                return HOSTNAME_REGEX.test(value)
+                    ? null
+                    : "Enter a valid IP address (e.g. 192.168.1.1) or hostname (e.g. example.com)";
+            },
+            port: (value) => {
+                if (!customConfig) return null;
+                if (!value) return "Target port is required";
+                if (!/^\d+$/.test(value)) return "Port must be numeric";
+                const portNum = parseInt(value, 10);
+                return portNum >= 1 && portNum <= 65535 ? null : "Port must be between 1 and 65535";
             },
         },
     });
@@ -270,6 +306,7 @@ export function BEDTool() {
                         required
                         value={selectedPlugin}
                         onChange={handlePluginChange}
+                        error={form.errors.plugin}
                     />
                     {pluginsRequiringAuth.includes(selectedPlugin) && (
                         <>
